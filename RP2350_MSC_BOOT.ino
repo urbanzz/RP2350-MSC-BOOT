@@ -269,7 +269,7 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
 static const tusb_desc_device_t desc_device = {
     .bLength            = sizeof(tusb_desc_device_t),
     .bDescriptorType    = TUSB_DESC_DEVICE,
-    .bcdUSB             = 0x0210,   // USB 2.1 (нужен для BOS)
+    .bcdUSB             = 0x0200,   // USB 2.0 — без BOS, Windows использует usbstor.sys
     .bDeviceClass       = 0x00,
     .bDeviceSubClass    = 0x00,
     .bDeviceProtocol    = 0x00,
@@ -302,47 +302,10 @@ const uint8_t *tud_descriptor_configuration_cb(uint8_t index) {
     return desc_config;
 }
 
-// BOS descriptor с MS OS 2.0 (как у bootloader, non-composite)
-#define MS_OS_20_DESC_LEN  0x9Eu
-#define BOS_TOTAL_LEN      (TUD_BOS_DESC_LEN + TUD_BOS_MICROSOFT_OS_DESC_LEN)
-
-static const uint8_t desc_bos[] = {
-    TUD_BOS_DESCRIPTOR(BOS_TOTAL_LEN, 1),
-    TUD_BOS_MS_OS_20_DESCRIPTOR(MS_OS_20_DESC_LEN, 1)
-};
-
-const uint8_t *tud_descriptor_bos_cb(void) {
-    return desc_bos;
-}
-
-// MS OS 2.0 descriptor set (non-composite, size=0x9E)
-static const uint8_t ms_os20_desc[] = {
-    0x0A,0x00, 0x00,0x00, 0x00,0x00,0x03,0x06, MS_OS_20_DESC_LEN,0x00,  // header
-    0x14,0x00, 0x03,0x00,                                                  // compatible ID
-    'W','I','N','U','S','B',0x00,0x00,                                     // WINUSB
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,                               // sub-compat
-    0x80,0x00, 0x04,0x00, 0x01,0x00, 0x28,0x00,                           // reg property
-    // DeviceInterfaceGUID name (40 bytes)
-    'D',0,'e',0,'v',0,'i',0,'c',0,'e',0,'I',0,'n',0,'t',0,'e',0,
-    'r',0,'f',0,'a',0,'c',0,'e',0,'G',0,'U',0,'I',0,'D',0,0,0,
-    0x4E,0x00,                                                             // data size 78
-    // {ecceff35-146c-4ff3-acd9-8f992d09acdd}
-    '{',0,'e',0,'c',0,'c',0,'e',0,'f',0,'f',0,'3',0,'5',0,'-',0,
-    '1',0,'4',0,'6',0,'c',0,'-',0,'4',0,'f',0,'f',0,'3',0,'-',0,
-    'a',0,'c',0,'d',0,'9',0,'-',0,'8',0,'f',0,'9',0,'9',0,'2',0,
-    'd',0,'0',0,'9',0,'a',0,'c',0,'d',0,'d',0,'}',0,0,0
-};
-
-bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
-                                 tusb_control_request_t const *req) {
-    if (stage != CONTROL_STAGE_SETUP) return true;
-    if (req->bRequest == 1 && req->wIndex == 7) {
-        return tud_control_xfer(rhport, req, (void*)ms_os20_desc, sizeof(ms_os20_desc));
-    }
-    return false;
-}
-
 // String descriptors
+// BOS/MS OS 2.0 убран: bcdUSB=0x0200 не требует BOS, и без него Windows
+// автоматически загружает usbstor.sys по классу 0x08/0x06/0x50 (MSC Bulk-Only).
+// С WINUSB-compatible-ID в MS OS 2.0 Windows ставил WinUSB вместо usbstor.
 static char serial_str[17];
 
 static const uint16_t *make_str(const char *s, uint16_t *buf, uint8_t cap) {
