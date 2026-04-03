@@ -72,7 +72,8 @@ static uint8_t  sec_buf[SECTOR_SIZE];
 // Sparse sector storage
 struct WrittenSector { uint32_t lba; uint8_t data[SECTOR_SIZE]; };
 static WrittenSector written_sectors[MAX_WRITTEN_SECTORS];
-static uint8_t written_count = 0;
+static uint8_t written_count      = 0;  // всего секторов в пуле
+static uint8_t written_data_count = 0;  // только data-секторы (LBA >= ABS_LBA_DATA)
 
 // State machine
 enum class State : uint8_t { IDLE, STREAMING };
@@ -136,9 +137,12 @@ static void led_flash_sync(uint8_t count, uint32_t color,
     }
 }
 
-// Градиент по заполнению sparse pool: белый(0%) → зелёный(33%) → жёлтый(66%) → красный(100%)
+// Градиент по заполнению data-секторов пула: белый(0%) → зелёный(33%) → жёлтый(66%) → красный(100%)
+// Используем written_data_count (LBA >= ABS_LBA_DATA), FS-метаданные в процент не входят
 static uint32_t write_fill_color() {
-    uint8_t pct = (uint8_t)((uint32_t)written_count * 100u / MAX_WRITTEN_SECTORS);
+    // Ёмкость для данных = пул минус типичный overhead файловой системы (~20 секторов)
+    static const uint8_t DATA_CAPACITY = MAX_WRITTEN_SECTORS - 20u;
+    uint8_t pct = (uint8_t)((uint32_t)written_data_count * 100u / DATA_CAPACITY);
     uint8_t r, g, b;
     if (pct < 33u) {
         uint8_t t = pct * 255u / 33u;
@@ -272,6 +276,7 @@ static void store_written(uint32_t lba, const uint8_t* data,
         memset(written_sectors[written_count].data, 0, SECTOR_SIZE);
     memcpy(written_sectors[written_count].data + offset, data, size);
     written_count++;
+    if (lba >= ABS_LBA_DATA) written_data_count++;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -619,7 +624,8 @@ static void stream_process_new(uint32_t start_cluster,
 static void disk_reset() {
     dbg_sendf("DISK RESET: processed=%lu wr=%u",
               (unsigned long)g_processed_bytes, (unsigned)written_count);
-    written_count     = 0;
+    written_count      = 0;
+    written_data_count = 0;
     g_stream_cluster  = 0;
     g_processed_bytes = 0;
     s_line_len        = 0;
@@ -755,8 +761,9 @@ void loop() {
         {
             uint8_t  _pct = (uint8_t)((uint32_t)written_count * 100u / MAX_WRITTEN_SECTORS);
             uint32_t _c   = write_fill_color();
-            dbg_sendf("LED: wr=%u/%u pct=%u%% rgb=#%02X%02X%02X",
-                      (unsigned)written_count, (unsigned)MAX_WRITTEN_SECTORS,
+            dbg_sendf("LED: wr=%u data=%u/%u pct=%u%% rgb=#%02X%02X%02X",
+                      (unsigned)written_count,
+                      (unsigned)written_data_count, (unsigned)(MAX_WRITTEN_SECTORS - 20u),
                       (unsigned)_pct,
                       (unsigned)((_c >> 16) & 0xFFu),
                       (unsigned)((_c >>  8) & 0xFFu),
