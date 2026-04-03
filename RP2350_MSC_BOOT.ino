@@ -753,6 +753,16 @@ void loop() {
 
         g_write_pending = false;
         {
+            uint8_t  _pct = (uint8_t)((uint32_t)written_count * 100u / MAX_WRITTEN_SECTORS);
+            uint32_t _c   = write_fill_color();
+            dbg_sendf("LED: wr=%u/%u pct=%u%% rgb=#%02X%02X%02X",
+                      (unsigned)written_count, (unsigned)MAX_WRITTEN_SECTORS,
+                      (unsigned)_pct,
+                      (unsigned)((_c >> 16) & 0xFFu),
+                      (unsigned)((_c >>  8) & 0xFFu),
+                      (unsigned)( _c        & 0xFFu));
+        }
+        {
             TxtFile f;
             if (!fat16_find_txt(f)) {
                 dbg_send("STREAM: no .txt -> IDLE");
