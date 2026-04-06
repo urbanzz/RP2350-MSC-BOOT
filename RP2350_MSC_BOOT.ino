@@ -18,6 +18,7 @@
 
 #include <Arduino.h>
 #include <hardware/flash.h>
+#include <pico/mutex.h>
 #include <tusb.h>
 #include <stdarg.h>
 #include <Adafruit_NeoPixel.h>
@@ -35,8 +36,12 @@
 #define FAT_COUNT            2u
 #define MAX_ROOT_DIR_ENTRIES 512u
 #define ROOT_DIR_SECTORS     (MAX_ROOT_DIR_ENTRIES * 32u / SECTOR_SIZE)  // 32
-#define SECTORS_PER_FAT      ((2u * CLUSTER_COUNT + SECTOR_SIZE - 1u) / SECTOR_SIZE)  // 128
+#define SECTORS_PER_FAT      129u  // match RP2350 vanilla bootloader BPB exactly
 #define MEDIA_TYPE           0xF8u
+
+// Содержимое статичного INFO_UF2.TXT (виден хосту до первой записи)
+static const char INFO_TXT[] = "UF2 Bootloader Emulator\r\nBoard-ID: RPI-RP2350\r\n";
+#define INFO_TXT_LEN (sizeof(INFO_TXT)-1u)
 
 // Абсолютные LBA от MBR (LBA 0 = MBR)
 #define ABS_LBA_FAT1   2u
@@ -60,6 +65,11 @@ static bool     flash_looped = false;
 static uint32_t flash_color  = 0x181818u;
 static volatile uint32_t g_led_write_ms = 0;
 
+// Mutex: защищает written_sectors[], written_count, written_data_count,
+// written_fat_count, g_write_pending, g_last_write_ms, g_led_write_ms,
+// msc_ready — всё что пишет Core0 (MSC callbacks) и читает Core1 (streaming).
+static mutex_t g_pool_mutex;
+
 // FAT16 disk
 typedef struct __attribute__((packed)) {
     uint8_t  name[11]; uint8_t attr; uint8_t reserved; uint8_t ctime_frac;
@@ -72,8 +82,9 @@ static uint8_t  sec_buf[SECTOR_SIZE];
 // Sparse sector storage
 struct WrittenSector { uint32_t lba; uint8_t data[SECTOR_SIZE]; };
 static WrittenSector written_sectors[MAX_WRITTEN_SECTORS];
-static uint8_t written_count      = 0;  // всего секторов в пуле
-static uint8_t written_data_count = 0;  // только data-секторы (LBA >= ABS_LBA_DATA)
+static uint16_t written_count      = 0;  // всего секторов в пуле
+static uint16_t written_data_count = 0;  // только data-секторы (LBA >= ABS_LBA_DATA)
+static uint16_t written_fat_count  = 0;  // FAT-секторы (LBA в диапазоне FAT1)
 
 // State machine
 enum class State : uint8_t { IDLE, STREAMING };
@@ -82,10 +93,12 @@ static volatile bool     g_write_pending  = false;
 static volatile uint32_t g_last_write_ms  = 0;
 static uint32_t          g_stream_cluster  = 0;
 static uint32_t          g_processed_bytes = 0;
+static uint32_t          g_hint_cluster    = 0;  // cluster hint across disk_reset
 
 // USB
-static volatile bool    usb_mounted = false;
-static volatile uint8_t usb_events  = 0;
+static volatile bool     usb_mounted    = false;
+static volatile uint8_t  usb_events     = 0;
+static volatile uint32_t usb_mount_ms   = 0;  // millis() at mount
 #define USB_EV_MOUNT  0x01u
 #define USB_EV_UMOUNT 0x02u
 static bool    msc_ready   = true;
@@ -137,26 +150,27 @@ static void led_flash_sync(uint8_t count, uint32_t color,
     }
 }
 
-// Градиент по заполнению data-секторов пула: белый(0%) → зелёный(33%) → жёлтый(66%) → красный(100%)
+// Градиент по заполнению data-секторов пула: зелёный(0%) → жёлтый(50%) → красный(100%)
 // Используем written_data_count (LBA >= ABS_LBA_DATA), FS-метаданные в процент не входят
+// Значения в диапазоне 0x80-0xFF: после gamma32(0x80)≈64, gamma32(0xFF)=255 — хорошо видны
 static uint32_t write_fill_color() {
-    // Ёмкость для данных = пул минус типичный overhead файловой системы (~20 секторов)
-    static const uint8_t DATA_CAPACITY = MAX_WRITTEN_SECTORS - 20u;
+    static const uint16_t DATA_CAPACITY = MAX_WRITTEN_SECTORS - 20u;
     uint8_t pct = (uint8_t)((uint32_t)written_data_count * 100u / DATA_CAPACITY);
-    uint8_t r, g, b;
-    if (pct < 33u) {
-        uint8_t t = pct * 255u / 33u;
-        r = 0x18u - (uint8_t)((uint16_t)0x18u * t / 255u);
-        g = 0x18u + (uint8_t)((uint16_t)0x18u * t / 255u);
-        b = 0x18u - (uint8_t)((uint16_t)0x18u * t / 255u);
-    } else if (pct < 66u) {
-        uint8_t t = (pct - 33u) * 255u / 33u;
-        r = (uint8_t)((uint16_t)0x30u * t / 255u); g = 0x30u; b = 0u;
+    if (pct > 100u) pct = 100u;  // clamp: data_count может превысить оценку оверхеда
+    uint8_t r, g;
+    if (pct < 50u) {
+        // зелёный → жёлтый: G=0xFF, R 0x00→0xFF
+        r = (uint8_t)((uint16_t)pct * 2u * 0xFFu / 100u);
+        g = 0xFFu;
     } else {
-        uint8_t t = (uint8_t)min(255, (int)(pct - 66) * 255 / 34);
-        r = 0x30u; g = 0x30u - (uint8_t)((uint16_t)0x30u * t / 255u); b = 0u;
+        // жёлтый → красный: R=0xFF, G 0xFF→0x00
+        uint8_t t = (uint8_t)((uint16_t)(pct - 50u) * 2u * 0xFFu / 100u);
+        r = 0xFFu;
+        g = 0xFFu - t;
     }
-    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+    // NEO_GRB: провод = [G, R, B], т.е. bits[23:16] → физический GREEN, bits[15:8] → RED.
+    // Кладём g в биты[23:16] и r в биты[15:8] — тогда физика совпадает с задумкой.
+    return ((uint32_t)g << 16) | ((uint32_t)r << 8);
 }
 
 static void led_update() {
@@ -228,55 +242,124 @@ static void fill_sector(uint32_t lba, uint8_t *buf) {
     }
     lba--;
 
-    if (lba < SECTORS_PER_FAT * FAT_COUNT) {  // FAT1 + FAT2 (пустые)
+    if (lba < SECTORS_PER_FAT * FAT_COUNT) {  // FAT1 + FAT2
         if ((lba % SECTORS_PER_FAT) == 0u) {
             uint16_t *p = (uint16_t*)buf;
             p[0] = 0xFF00u | MEDIA_TYPE;  // FAT ID (cluster 0)
             p[1] = 0xFFFFu;               // cluster 1 reserved
+            p[2] = 0xFFFFu;               // cluster 2 = INFO_UF2.TXT (EOF)
+            p[3] = 0xFFFFu;               // cluster 3 = output_data/ dir (EOF)
+            p[4] = 0xFFFFu;               // cluster 4 = output_data/wc/ dir (EOF)
         }
         return;
     }
     lba -= SECTORS_PER_FAT * FAT_COUNT;
 
-    if (lba < ROOT_DIR_SECTORS) {  // Root dir: только метка тома
+    if (lba < ROOT_DIR_SECTORS) {  // Root dir
         if (lba == 0u) {
             DirEntry *e = (DirEntry*)buf;
+            // Запись 0: метка тома
             memcpy(e[0].name, "RPI-RP2350 ", 11);
             e[0].attr  = 0x08u | 0x20u;  // VOLUME_LABEL | ARCHIVE
             e[0].ctime = RPI_TIME; e[0].cdate = RPI_DATE;
             e[0].mtime = RPI_TIME; e[0].mdate = RPI_DATE;
+            // Запись 1: INFO_UF2.TXT (cluster 2)
+            memcpy(e[1].name, "INFO_UF2TXT", 11);
+            e[1].attr       = 0x20u;  // ARCHIVE
+            e[1].ctime      = RPI_TIME; e[1].cdate = RPI_DATE;
+            e[1].mtime      = RPI_TIME; e[1].mdate = RPI_DATE;
+            e[1].cluster_lo = 2u;
+            e[1].size       = INFO_TXT_LEN;
+            // Запись 2: LFN для "output_data" (checksum от "OUTPUT~1   " = 0x2D)
+            // LFN entry (32 bytes): seq, name1[10], attr=0x0F, type, cksum, name2[12], cluster[2], name3[4]
+            static const uint8_t lfn_od[32] = {
+                0x41,                                                   // seq: last+first, #1
+                'o',0,'u',0,'t',0,'p',0,'u',0,                         // name1: chars 1-5
+                0x0F, 0x00, 0x2D,                                       // attr, type, checksum
+                't',0,'_',0,'d',0,'a',0,'t',0,'a',0,                   // name2: chars 6-11
+                0x00,0x00,                                              // cluster
+                0x00,0x00, 0xFF,0xFF                                    // name3: null-term, pad
+            };
+            memcpy(buf + 2*32, lfn_od, 32);
+            // Запись 3: short name "OUTPUT~1" → cluster 3
+            memcpy(e[3].name, "OUTPUT~1   ", 11);
+            e[3].attr       = 0x10u;  // DIRECTORY
+            e[3].ctime      = RPI_TIME; e[3].cdate = RPI_DATE;
+            e[3].adate      = RPI_DATE;
+            e[3].mtime      = RPI_TIME; e[3].mdate = RPI_DATE;
+            e[3].cluster_lo = 3u;
         }
         return;
     }
-    // Data area: нули
+    lba -= ROOT_DIR_SECTORS;
+    // Data area
+    if (lba == 0u) {  // cluster 2: INFO_UF2.TXT
+        uint32_t n = INFO_TXT_LEN < SECTOR_SIZE ? INFO_TXT_LEN : SECTOR_SIZE;
+        memcpy(buf, INFO_TXT, n);
+    } else if (lba == 8u) {  // cluster 3: output_data/ directory
+        DirEntry *e = (DirEntry*)buf;
+        memcpy(e[0].name, ".          ", 11); e[0].attr = 0x10u;
+        e[0].ctime = RPI_TIME; e[0].cdate = RPI_DATE;
+        e[0].mtime = RPI_TIME; e[0].mdate = RPI_DATE;
+        e[0].cluster_lo = 3u;
+        memcpy(e[1].name, "..         ", 11); e[1].attr = 0x10u;
+        e[1].ctime = RPI_TIME; e[1].cdate = RPI_DATE;
+        e[1].mtime = RPI_TIME; e[1].mdate = RPI_DATE;
+        e[1].cluster_lo = 0u;  // root в FAT16 = кластер 0
+        memcpy(e[2].name, "WC         ", 11); e[2].attr = 0x10u;
+        e[2].ctime = RPI_TIME; e[2].cdate = RPI_DATE;
+        e[2].adate = RPI_DATE;
+        e[2].mtime = RPI_TIME; e[2].mdate = RPI_DATE;
+        e[2].cluster_lo = 4u;
+    } else if (lba == 16u) {  // cluster 4: output_data/wc/ directory
+        DirEntry *e = (DirEntry*)buf;
+        memcpy(e[0].name, ".          ", 11); e[0].attr = 0x10u;
+        e[0].ctime = RPI_TIME; e[0].cdate = RPI_DATE;
+        e[0].mtime = RPI_TIME; e[0].mdate = RPI_DATE;
+        e[0].cluster_lo = 4u;
+        memcpy(e[1].name, "..         ", 11); e[1].attr = 0x10u;
+        e[1].ctime = RPI_TIME; e[1].cdate = RPI_DATE;
+        e[1].mtime = RPI_TIME; e[1].mdate = RPI_DATE;
+        e[1].cluster_lo = 3u;
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════
    Sparse sector storage
    ═══════════════════════════════════════════════════════════════════ */
 static const uint8_t* get_written(uint32_t lba) {
-    for (uint8_t i = 0; i < written_count; i++)
+    for (uint16_t i = 0; i < written_count; i++)
         if (written_sectors[i].lba == lba) return written_sectors[i].data;
     return nullptr;
 }
 
 static void store_written(uint32_t lba, const uint8_t* data,
                            uint32_t offset, uint32_t size) {
-    for (uint8_t i = 0; i < written_count; i++) {
+    // Update existing entry — no pool resize, safe without mutex
+    for (uint16_t i = 0; i < written_count; i++) {
         if (written_sectors[i].lba == lba) {
             memcpy(written_sectors[i].data + offset, data, size);
             return;
         }
     }
-    if (written_count >= MAX_WRITTEN_SECTORS) return;
-    written_sectors[written_count].lba = lba;
-    if (offset != 0u || size != SECTOR_SIZE)
-        fill_sector(lba, written_sectors[written_count].data);
-    else
-        memset(written_sectors[written_count].data, 0, SECTOR_SIZE);
-    memcpy(written_sectors[written_count].data + offset, data, size);
+    // Appending a new entry: guard written_count bounds check + increment
+    // against concurrent disk_reset() on Core1 which zeroes written_count.
+    mutex_enter_blocking(&g_pool_mutex);
+    if (written_count >= MAX_WRITTEN_SECTORS) { mutex_exit(&g_pool_mutex); return; }
+    uint16_t slot = written_count;
     written_count++;
-    if (lba >= ABS_LBA_DATA) written_data_count++;
+    bool is_data = (lba >= ABS_LBA_DATA);
+    bool is_fat  = (lba >= ABS_LBA_FAT1 && lba < ABS_LBA_FAT2);
+    if (is_data)  written_data_count++;
+    if (is_fat)   written_fat_count++;
+    mutex_exit(&g_pool_mutex);
+
+    written_sectors[slot].lba = lba;
+    if (offset != 0u || size != SECTOR_SIZE)
+        fill_sector(lba, written_sectors[slot].data);
+    else
+        memset(written_sectors[slot].data, 0, SECTOR_SIZE);
+    memcpy(written_sectors[slot].data + offset, data, size);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -286,7 +369,14 @@ static uint16_t fat16_next(uint32_t cluster) {
     uint32_t sec_off  = cluster >> 8u;
     uint32_t byte_off = (cluster & 0xFFu) << 1u;
     const uint8_t* sec = get_written(ABS_LBA_FAT1 + sec_off);
-    if (!sec) return 0xFFFFu;
+    if (!sec) {
+        // FAT sector not in pool (Windows only writes FAT for new end-of-chain
+        // clusters, never for the middle of an existing cached chain).
+        // Assume sequential allocation — valid for fresh FAT16 (Windows allocates
+        // contiguously on a clean disk). This lets us walk the chain even when
+        // intermediate FAT sectors are absent from the pool after disk_reset.
+        return (uint16_t)(cluster + 1u);
+    }
     return sec[byte_off] | ((uint16_t)sec[byte_off + 1u] << 8u);
 }
 
@@ -329,13 +419,116 @@ static void fat16_scan_dir(uint32_t cluster, TxtFile& out, uint8_t depth) {
     }
 }
 
+// Returns true if FAT sector for cluster cl is present in pool.
+static bool fat16_have_fat(uint32_t cl) {
+    return get_written(ABS_LBA_FAT1 + (cl >> 8u)) != nullptr;
+}
+
 static bool fat16_find_txt(TxtFile& out) {
     out.start_cluster = 0u; out.file_size = 0u;
+
+    // Primary: directory tree traversal via root dir sectors.
     for (uint32_t lba = ABS_LBA_ROOT; lba < ABS_LBA_DATA; lba++) {
         const uint8_t* sec = get_written(lba);
-        if (sec) fat16_scan_sector(sec, out, 2u);  // root → subdir → subsubdir
+        if (sec) fat16_scan_sector(sec, out, 2u);
     }
+
+    // Fallback: linear scan of all pooled data sectors.
+    // After disk_reset() Windows may write the wc/ dir sector directly into
+    // the data zone without re-writing root dir first.
+    if (out.start_cluster < 2u || out.file_size == 0u) {
+        for (uint16_t i = 0u; i < written_count; i++) {
+            if (written_sectors[i].lba >= ABS_LBA_DATA)
+                fat16_scan_sector(written_sectors[i].data, out, 0u);
+        }
+    }
+
+    // Sanity check for hint path only (file_size == 0):
+    // When no dir entry was found, we fall back to hint cluster. In that case we
+    // require at least one FAT sector in pool so fat16_next has real end-of-chain
+    // markers and won't walk past the actual file into unrelated sectors.
+    // When dir scan found a real entry (file_size > 0), we trust it unconditionally:
+    // fat16_next uses sequential cluster+1 which is valid for fresh FAT16, and the
+    // file boundary is enforced by file_size in stream_process_new.
+    if (out.start_cluster >= 2u && out.file_size == 0u && written_fat_count == 0u) {
+        out.start_cluster = 0u;
+    }
+
+    // Hint — last resort only.
+    // Used when dir scan found nothing valid but Windows has already written FAT
+    // entries for post-reset clusters. The hint was saved from g_stream_cluster
+    // at the time of disk_reset; file_size is unknown (caller walks the chain).
+    if (out.start_cluster < 2u &&
+        g_hint_cluster >= 2u && fat16_have_fat(g_hint_cluster)) {
+        out.start_cluster = g_hint_cluster;
+        out.file_size = 0u;
+    }
+
+    // Clear hint once a proper dir scan finds the real file (file_size > 0).
+    if (g_hint_cluster >= 2u && out.start_cluster >= 2u && out.file_size > 0u)
+        g_hint_cluster = 0u;
+
     return out.start_cluster >= 2u;
+}
+
+// Диагностика при "no .txt": показывает что именно есть в пуле.
+// Вызывается с троттлингом — не чаще раза в 10 с.
+static void fat16_dbg_scan() {
+    // Считаем секторы по диапазонам
+    uint8_t n_fat = 0, n_root = 0, n_data = 0;
+    for (uint16_t i = 0; i < written_count; i++) {
+        uint32_t lba = written_sectors[i].lba;
+        if      (lba >= ABS_LBA_FAT1 && lba < ABS_LBA_FAT2)  n_fat++;
+        else if (lba >= ABS_LBA_ROOT && lba < ABS_LBA_DATA)   n_root++;
+        else if (lba >= ABS_LBA_DATA)                          n_data++;
+    }
+
+    // Первая не-пустая запись в корневом каталоге
+    char root_name[9] = "--------";
+    uint16_t root_cl = 0;
+    bool found_root = false;
+    for (uint32_t lba = ABS_LBA_ROOT; lba < ABS_LBA_DATA && !found_root; lba++) {
+        const uint8_t* sec = get_written(lba);
+        if (!sec) continue;
+        for (int i = 0; i < (int)(SECTOR_SIZE / 32u); i++) {
+            const uint8_t* de = sec + i * 32u;
+            if (de[0] == 0x00u) break;
+            if (de[0] == 0xE5u || de[11] == 0x0Fu) continue;
+            for (int j = 0; j < 8; j++) root_name[j] = (char)de[j];
+            root_name[8] = '\0';
+            root_cl = de[26] | ((uint16_t)de[27] << 8u);
+            found_root = true;
+            break;
+        }
+    }
+
+    // Ищем .TXT (в т.ч. с sz=0) во всех написанных секторах — помогает найти
+    // файл, который хост создал но ещё не записал размер в dir-запись
+    uint32_t txt_cl = 0, txt_sz = 0;
+    for (uint16_t i = 0; i < written_count && txt_cl == 0; i++) {
+        const uint8_t* sec = written_sectors[i].data;
+        for (int j = 0; j < (int)(SECTOR_SIZE / 32u); j++) {
+            const uint8_t* de = sec + j * 32u;
+            if (de[0] == 0x00u) break;
+            if (de[0] == 0xE5u || de[11] == 0x0Fu || (de[11] & 0x18u)) continue;
+            uint8_t e8  = de[8];  if (e8  >= 'a' && e8  <= 'z') e8  -= 32u;
+            uint8_t e9  = de[9];  if (e9  >= 'a' && e9  <= 'z') e9  -= 32u;
+            uint8_t e10 = de[10]; if (e10 >= 'a' && e10 <= 'z') e10 -= 32u;
+            if (e8 == 'T' && e9 == 'X' && e10 == 'T') {
+                txt_cl = de[26] | ((uint16_t)de[27] << 8u);
+                txt_sz = de[28] | ((uint32_t)de[29]<<8u)
+                       | ((uint32_t)de[30]<<16u) | ((uint32_t)de[31]<<24u);
+                break;
+            }
+        }
+    }
+
+    dbg_sendf("FAT-DBG: pool=%u(fat=%u,root=%u,data=%u) "
+              "root1=\"%.8s\"cl=%u txt:cl=%lu sz=%lu",
+              (unsigned)written_count,
+              (unsigned)n_fat, (unsigned)n_root, (unsigned)n_data,
+              root_name, (unsigned)root_cl,
+              (unsigned long)txt_cl, (unsigned long)txt_sz);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -399,7 +592,7 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const cmd[16],
 static const tusb_desc_device_t desc_device = {
     .bLength            = sizeof(tusb_desc_device_t),
     .bDescriptorType    = TUSB_DESC_DEVICE,
-    .bcdUSB             = 0x0200,  // USB 2.0, без BOS — Windows ставит usbstor.sys
+    .bcdUSB             = 0x0200,  // USB 2.0 — без BOS, Windows грузит usbstor.sys по классу MSC
     .bDeviceClass       = 0x00,
     .bDeviceSubClass    = 0x00,
     .bDeviceProtocol    = 0x00,
@@ -427,6 +620,7 @@ const uint8_t *tud_descriptor_configuration_cb(uint8_t index) {
     (void)index; return desc_config;
 }
 
+
 static const uint16_t* make_str(const char* s, uint16_t* buf, uint8_t cap) {
     uint8_t len = strlen(s); if (len > cap-1) len = cap-1;
     buf[0] = (TUSB_DESC_STRING << 8) | (2 + 2*len);
@@ -449,7 +643,7 @@ const uint16_t *tud_descriptor_string_cb(uint8_t idx, uint16_t langid) {
 /* ═══════════════════════════════════════════════════════════════════
    USB mount callbacks
    ═══════════════════════════════════════════════════════════════════ */
-void tud_mount_cb(void)   { usb_mounted = true;  usb_events |= USB_EV_MOUNT;  }
+void tud_mount_cb(void)   { usb_mounted = true; usb_mount_ms = millis(); usb_events |= USB_EV_MOUNT;  }
 void tud_umount_cb(void)  { usb_mounted = false; usb_events |= USB_EV_UMOUNT; }
 void tud_suspend_cb(bool) {}
 void tud_resume_cb(void)  {}
@@ -463,7 +657,7 @@ static void ch9120_raw_cmd(uint8_t cmd, const uint8_t* data, uint8_t len) {
     CH9120_UART.write(cmd);
     if (data && len > 0) CH9120_UART.write(data, len);
     CH9120_UART.flush();
-    tud_delay(50);
+    delay(50);  // Core0 handles tud_task() — plain delay() is fine here
 }
 
 static void ch9120_cfg_enter() {
@@ -472,19 +666,19 @@ static void ch9120_cfg_enter() {
     CH9120_UART.begin(CH9120_CFG_BAUD);
     while (CH9120_UART.available()) CH9120_UART.read();
     digitalWrite(CH9120_CFG_PIN, LOW);
-    tud_delay(500);
+    delay(500);
 }
 
 static void ch9120_cfg_exit(bool save_eeprom) {
     const uint8_t hdr[2] = {0x57, 0xAB};
     if (save_eeprom) {
         CH9120_UART.write(hdr, 2); CH9120_UART.write((uint8_t)0x0D);
-        CH9120_UART.flush(); tud_delay(200);
+        CH9120_UART.flush(); delay(200);
     }
     CH9120_UART.write(hdr, 2); CH9120_UART.write((uint8_t)0x0E);
-    CH9120_UART.flush(); tud_delay(200);
+    CH9120_UART.flush(); delay(200);
     CH9120_UART.write(hdr, 2); CH9120_UART.write((uint8_t)0x5E);
-    CH9120_UART.flush(); tud_delay(500);
+    CH9120_UART.flush(); delay(500);
     digitalWrite(CH9120_CFG_PIN, HIGH);
     CH9120_UART.setTX(CH9120_TX_PIN);
     CH9120_UART.setRX(CH9120_RX_PIN);
@@ -519,7 +713,7 @@ static bool tcp_connected() {
 static bool tcp_wait_connected(uint32_t timeout_ms) {
     uint32_t t0 = millis();
     while (!tcp_connected() && millis() - t0 < timeout_ms) {
-        tud_task(); delay(50);
+        delay(50);  // Core0 handles tud_task() — no need to call it here
     }
     return tcp_connected();
 }
@@ -619,20 +813,40 @@ static void stream_process_new(uint32_t start_cluster,
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   Disk reset — очищаем sparse storage, сигнал хосту: media changed
+   Disk reset — сохраняем метаданные, чистим файловые данные,
+   сигнал хосту: media changed.
+   ───────────────────────────────────────────────────────────────────
+   Полная очистка пула — хост видит чистый диск после media-change
+   и пишет структуру директорий заново с кластера 2.
+
+   Частичное сохранение FAT+dir (старый подход) не работает: Windows
+   видит в FAT что кластеры 2-7 заняты старыми данными и выделяет
+   output_data/wc в кластер 8+, недостижимый через fat16_find_txt().
    ═══════════════════════════════════════════════════════════════════ */
 static void disk_reset() {
-    dbg_sendf("DISK RESET: processed=%lu wr=%u",
-              (unsigned long)g_processed_bytes, (unsigned)written_count);
+    // Remember the current file cluster so we can resume streaming after reset
+    // without waiting for Windows to re-flush root dir / wc/ directory sector.
+    if (g_stream_cluster >= 2u) g_hint_cluster = g_stream_cluster;
+
+    dbg_sendf("DISK RESET: processed=%lu wr=%u->0(full clear)",
+              (unsigned long)g_processed_bytes,
+              (unsigned)written_count);
+
+    // Atomic pool clear — guard against concurrent store_written on Core0
+    mutex_enter_blocking(&g_pool_mutex);
     written_count      = 0;
     written_data_count = 0;
+    written_fat_count  = 0;
+    mutex_exit(&g_pool_mutex);
+
     g_stream_cluster  = 0;
     g_processed_bytes = 0;
     s_line_len        = 0;
     state             = State::IDLE;
 
+    // Core0 keeps calling tud_task() continuously — plain delay() is enough.
     msc_ready = false;
-    tud_delay(250);  // хост видит NOT READY → сбрасывает кэш ФС
+    delay(250);  // хост видит NOT READY → сбрасывает кэш ФС
     msc_ready = true;
 
     led_flash_sync(2, LED_WHITE, 80, 80);
@@ -640,7 +854,8 @@ static void disk_reset() {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   setup()
+   setup() — Core0
+   Инициализирует USB как можно быстрее. CH9120 и TCP — в setup1().
    ═══════════════════════════════════════════════════════════════════ */
 void setup() {
     pixel.begin();
@@ -654,9 +869,6 @@ void setup() {
     digitalWrite(CH9120_CFG_PIN, HIGH);
     digitalWrite(CH9120_RST_PIN, LOW);
 
-    // Boot alive: 2 вспышки белым
-    led_flash_sync(2, LED_WHITE, 80, 80);
-
     // Serial number из Chip ID
     uint8_t id[8]; flash_get_unique_id(id);
     snprintf(serial_str, sizeof(serial_str),
@@ -664,30 +876,43 @@ void setup() {
              id[0],id[1],id[2],id[3],id[4],id[5],id[6],id[7]);
     memcpy(&disk_serial, id, 4);
 
-    // TinyUSB init
+    mutex_init(&g_pool_mutex);
+
+    // TinyUSB init — немедленно, без каких-либо задержек до него
     tusb_rhport_init_t dev_init = { .role = TUSB_ROLE_DEVICE, .speed = TUSB_SPEED_AUTO };
     tusb_init(0, &dev_init);
+    // Дальше loop() крутит tud_task(). Core1 (setup1) ждёт usb_mounted.
+}
 
-    // Ждём монтирования USB (до USB_MOUNT_TIMEOUT_MS)
-    // CH9120 всё ещё в RESET
-    {
-        uint32_t t0 = millis();
-        while (!usb_mounted && millis() - t0 < USB_MOUNT_TIMEOUT_MS) {
-            tud_task(); delay(1);
-        }
+/* ═══════════════════════════════════════════════════════════════════
+   loop() — Core0: только USB, ничего больше
+   ═══════════════════════════════════════════════════════════════════ */
+void loop() {
+    tud_task();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   setup1() — Core1: CH9120, TCP, всё что не USB
+   ═══════════════════════════════════════════════════════════════════ */
+void setup1() {
+    // Ждём монтирования USB — Core0 крутит tud_task() параллельно
+    uint32_t t0 = millis();
+    while (!usb_mounted && millis() - t0 < USB_MOUNT_TIMEOUT_MS) {
+        delay(1);
     }
 
     // Поднимаем CH9120 и настраиваем TCP
     digitalWrite(CH9120_RST_PIN, HIGH);
-    tud_delay(300);
+    delay(300);
     ch9120_setup_tcp();
 
     // Ждём TCP-соединения
     led_flash(255, LED_ORANGE, 100, 100, true);
     bool tcp_ok = tcp_wait_connected(TCP_CONNECT_TIMEOUT_MS);
 
-    dbg_sendf("BOOT: USB=%s TCP=%s wr_pool=%u t=%lums",
+    dbg_sendf("BOOT: USB=%s(t=%lums) TCP=%s wr_pool=%u total=%lums",
               usb_mounted ? "MOUNTED" : "TIMEOUT",
+              (unsigned long)usb_mount_ms,
               tcp_ok ? "OK" : "TIMEOUT",
               (unsigned)MAX_WRITTEN_SECTORS,
               (unsigned long)millis());
@@ -699,10 +924,9 @@ void setup() {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   loop()
+   loop1() — Core1: streaming, TCP events, LED, state machine
    ═══════════════════════════════════════════════════════════════════ */
-void loop() {
-    tud_task();
+void loop1() {
     led_update();
 
     // USB events
@@ -743,13 +967,16 @@ void loop() {
             flash_total = 0u; led_set(LED_OFF);
         }
 
-        // Переполнение sparse pool → немедленный сброс
-        if (written_count >= MAX_WRITTEN_SECTORS - 4u) {
+        // Принудительный сброс при 95% — окна тишины так и не было
+        if (written_count      >= (uint16_t)(MAX_WRITTEN_SECTORS * POOL_RESET_PCT / 100u) ||
+            written_data_count >= (uint16_t)(MAX_WRITTEN_SECTORS * POOL_RESET_PCT / 100u)) {
             disk_reset(); break;
         }
 
-        // Тишина STREAM_IDLE_RESET_MS → сброс диска
-        if (!g_write_pending && now - g_last_write_ms > STREAM_IDLE_RESET_MS) {
+        // Сброс по окну тишины — только если пул уже >= 90%
+        if ((written_count      >= (uint16_t)(MAX_WRITTEN_SECTORS * STREAM_IDLE_PCT / 100u) ||
+             written_data_count >= (uint16_t)(MAX_WRITTEN_SECTORS * STREAM_IDLE_PCT / 100u)) &&
+            !g_write_pending && now - g_last_write_ms > STREAM_IDLE_RESET_MS) {
             disk_reset(); break;
         }
 
@@ -773,6 +1000,13 @@ void loop() {
             TxtFile f;
             if (!fat16_find_txt(f)) {
                 dbg_send("STREAM: no .txt -> IDLE");
+                // Диагностика: не чаще раза в 10 с — показывает состояние пула
+                // чтобы понять что делает хост (VxWorks/Windows) после disk reset
+                static uint32_t dbg_scan_ms = 0;
+                if (millis() - dbg_scan_ms >= 10000u) {
+                    dbg_scan_ms = millis();
+                    fat16_dbg_scan();
+                }
                 g_stream_cluster = 0; g_processed_bytes = 0; s_line_len = 0;
                 state = State::IDLE;
                 led_flash(255, tcp_now ? LED_BLUE : LED_RED, 500, 500, true);
@@ -788,6 +1022,17 @@ void loop() {
             if (f.file_size > g_processed_bytes) {
                 stream_process_new(f.start_cluster, g_processed_bytes, f.file_size);
                 g_processed_bytes = f.file_size;
+            } else if (f.file_size == 0u) {
+                // Hint path: file_size unknown. Walk the FAT chain to count
+                // how many clusters are currently reachable, use as to_pos.
+                // fat16_next returns 0xFFFF when FAT sector not in pool — stops loop.
+                uint32_t eff = 0u;
+                for (uint32_t cl = f.start_cluster; cl >= 2u && cl < 0xFFF8u; cl = fat16_next(cl))
+                    eff += CLUSTER_SIZE;
+                if (eff > g_processed_bytes) {
+                    stream_process_new(f.start_cluster, g_processed_bytes, eff);
+                    g_processed_bytes = eff;
+                }
             }
         }
         break;

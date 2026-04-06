@@ -40,5 +40,13 @@
 #define STREAM_IDLE_RESET_MS    10000UL
 
 // ── Sparse sector pool ───────────────────────────────────────────
-// Количество секторов от хоста, которые держим в RAM (каждый = 512 байт)
-#define MAX_WRITTEN_SECTORS     128
+// Количество секторов от хоста, которые держим в RAM (каждый = 516 байт: lba+data).
+// Расчёт: 95% от 524288 байт RAM = 498073; минус ~11KB прочих глобалей; минус 32KB стека.
+// (498073 - 10904 - 32768) / 516 ≈ 880.
+#define MAX_WRITTEN_SECTORS     880
+
+// Пороги disk reset:
+//   STREAM_IDLE_PCT  — с этого % начинаем ждать окно тишины STREAM_IDLE_RESET_MS
+//   POOL_RESET_PCT   — принудительный reset если окна так и не было
+#define STREAM_IDLE_PCT         90
+#define POOL_RESET_PCT          95
